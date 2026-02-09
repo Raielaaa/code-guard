@@ -1,0 +1,50 @@
+services:
+  app:
+    container_name: guard-app
+    build: .
+    ports:
+      - "8081:8081"
+    env_file:
+      - .env
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://guard-postgres:5432/guard_db
+      - SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME}
+      - SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD}
+      - SPRING_DATA_REDIS_HOST=guard-redis
+      - SPRING_AI_OLLAMA_BASE_URL=http://guard-ollama:11434
+    depends_on:
+      - postgres
+      - redis
+      - ollama
+    restart: no
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: guard-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:latest
+    container_name: guard-redis
+    ports:
+      - "6379:6379"
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: guard-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: /bin/sh
+    command: "-c 'ollama serve & sleep 5 && ollama pull llama3.1:8b && ollama pull nomic-embed-text && wait'"
+
+volumes:
+  postgres_data:
+  ollama_data:

@@ -1,0 +1,9 @@
+.git
+.idea
+target
+mvnw
+mvnw.cmd
+# Ignore the heavy data folders!
+postgres_data
+ollama_data
+*.jar
