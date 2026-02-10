@@ -28,6 +28,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
 
   redis:
     image: redis:latest
@@ -43,7 +44,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     entrypoint: /bin/sh
-    command: "-c 'ollama serve & sleep 5 && ollama pull llama3.1:8b && ollama pull nomic-embed-text && wait'"
+    command: "-c 'ollama serve & sleep 10 && ollama pull llama3.2:3b && ollama pull nomic-embed-text && wait'"
 
 volumes:
   postgres_data:
