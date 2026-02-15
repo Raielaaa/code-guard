@@ -11,11 +11,12 @@ services:
       - SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME}
       - SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD}
       - SPRING_DATA_REDIS_HOST=guard-redis
-      - SPRING_AI_OLLAMA_BASE_URL=http://guard-ollama:11434
+#      - SPRING_AI_OLLAMA_BASE_URL=http://guard-ollama:11434
+      - SPRING_AI_OLLAMA_BASE_URL=http://host.docker.internal:11434
     depends_on:
       - postgres
       - redis
-      - ollama
+#      - ollama
     restart: no
   postgres:
     image: pgvector/pgvector:pg16
@@ -36,16 +37,16 @@ services:
     ports:
       - "6379:6379"
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: guard-ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    entrypoint: /bin/sh
-    command: "-c 'ollama serve & sleep 10 && ollama pull llama3.2:3b && ollama pull nomic-embed-text && wait'"
+#  ollama:
+#    image: ollama/ollama:latest
+#    container_name: guard-ollama
+#    ports:
+#      - "11434:11434"
+#    volumes:
+#      - ollama_data:/root/.ollama
+#    entrypoint: /bin/sh
+#    command: "-c 'ollama serve & sleep 10 && ollama pull llama3.2:3b && ollama pull nomic-embed-text && wait'"
 
 volumes:
   postgres_data:
-  ollama_data:
+#  ollama_data:
