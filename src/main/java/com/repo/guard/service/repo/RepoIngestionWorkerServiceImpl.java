@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
+import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 
 @Slf4j
 @Service
@@ -108,13 +109,24 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     private void cloneRepository(RepoIngestionRequestDto repo, File tempDir) throws Exception {
         //  clone the repo into the temp directory
         log.info("Cloning repo to: {}", tempDir.getAbsolutePath());
+
         //  if the temp directory already exists, delete it first to avoid conflicts
         if (tempDir.exists()) FileSystemUtils.deleteRecursively(tempDir);
 
-        //  clone the repository using JGit
+        //  create the credentials provider using the token
+        //  note: gitlab requires the username to be non-empty, but it ignores the actual
+        //  username string as long as the password is a valid personal access token.
+        UsernamePasswordCredentialsProvider credentialsProvider =
+                new UsernamePasswordCredentialsProvider(
+                        repo.getRepoUsername() != null ? repo.getRepoUsername() : "oauth2",
+                        repo.getRepoAccessToken()
+                );
+
+        //  clone the repository using JGit with authentication
         Git.cloneRepository()
                 .setURI(repo.getRepoUrl())
                 .setDirectory(tempDir)
+                .setCredentialsProvider(credentialsProvider) // <-- THIS IS THE CRITICAL FIX
                 .call();
     }
 
@@ -194,26 +206,61 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     }
 
     /**
-     * generates embeddings for each code chunk sequentially by calling the embedding model
-     * and sets the resulting vector on each chunk object
-     *
-     * @param chunksToInsert
+     * generates embeddings for each code chunk sequentially, utilizing a warmup
+     * and optimistic execution backed by exponential backoff.
      */
     private void generateEmbeddings(List<CodeChunk> chunksToInsert) {
         log.info("Parsed {} chunks. Generating embeddings...", chunksToInsert.size());
-        //  process chunks sequentially to avoid overwhelming the embedding model
+
+        //  warm up the model with a test embedding to ensure it's fully loaded into unified memory
+        try {
+            log.info("Warming up embedding model...");
+            embeddingModel.embed("model warmup test");
+            log.info("Model warmup complete.");
+        } catch (Exception e) {
+            log.warn("Model warmup failed, continuing anyway", e);
+        }
+
         int batchSize = 10;
-        //  iterate through each chunk, generate its embedding, and set it on the chunk object
+
+        //  process chunks optimistically. run as fast as possible and only delay if Ollama fails.
         for (int i = 0; i < chunksToInsert.size(); i++) {
             CodeChunk chunk = chunksToInsert.get(i);
 
-            //  generate embedding vector for the chunk content using the embedding model
-            float[] vector = embeddingModel.embed(chunk.getContent());
-            //  set the generated embedding vector on the chunk object for later db insertion
+            //  generate embedding vector with our safety net
+            float[] vector = generateEmbeddingWithRetry(chunk.getContent(), i, 3);
             chunk.setEmbedding(vector);
-            //  log progress every batchSize chunks to keep track of how many chunks have been processed
-            if (i % batchSize == 0) log.info("Processed {}/{} chunks...", i, chunksToInsert.size());
+
+            if (i > 0 && i % batchSize == 0) {
+                log.info("Processed {}/{} chunks...", i, chunksToInsert.size());
+            }
         }
+    }
+
+    private float[] generateEmbeddingWithRetry(String content, int chunkIndex, int maxRetries) {
+        int attempt = 0;
+        Exception lastException = null;
+        
+        while (attempt < maxRetries) {
+            try {
+                return embeddingModel.embed(content);
+            } catch (Exception err) {
+                lastException = err;
+                attempt++;
+                
+                if (attempt < maxRetries) {
+                    int waitTime = 5000 * attempt;
+                    log.warn("Embedding generation failed for chunk {}, attempt {}/{}. Waiting {}ms before retry...", chunkIndex, attempt, maxRetries, waitTime);
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+        
+        throw new RuntimeException("Failed to generate embedding after " + maxRetries + " attempts", lastException);
     }
 
     /**

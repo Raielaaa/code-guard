@@ -7,6 +7,8 @@ services:
     env_file:
       - .env
     environment:
+      - GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
+      - GITLAB_WEBHOOK_SECRET=${GITLAB_WEBHOOK_SECRET}
       - SPRING_DATASOURCE_URL=jdbc:postgresql://guard-postgres:5432/guard_db
       - SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME}
       - SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD}

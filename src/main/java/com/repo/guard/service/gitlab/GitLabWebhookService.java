@@ -81,6 +81,8 @@ public class GitLabWebhookService {
         String repoUrl = payload.path("project").path("web_url").asText();
 
         log.info("Started AI Code Review for Merge Request #{}", mrIid);
+
+        //  this will now block the thread until ingestion is 100% complete
         checkAndIngestRepo(repoUrl);
 
         GitLabApi gitLabApi = new GitLabApi(gitlabUrl, gitlabToken);
@@ -94,7 +96,7 @@ public class GitLabWebhookService {
 
         String diffString = diffBuilder.toString();
 
-        //  pass the raw List<Diff> to the context search instead of the String
+        //  we are guaranteed to have database chunks now
         String relatedContext = getRelatedCodebaseContext(mrWithChanges.getChanges(), repoUrl);
 
         //  pass both the context and the diff to the AI
@@ -102,7 +104,7 @@ public class GitLabWebhookService {
         String formattedComment = "**Guard AI Code Review:**\n\n" + reviewComment;
 
         //  post comment to the merge request thread
-        gitLabApi.getNotesApi().createMergeRequestNote(projectId, mrIid, formattedComment);
+        gitLabApi.getNotesApi().createMergeRequestNote(projectId, mrIid, formattedComment, null, false);
         log.info("Successfully posted AI review to GitLab MR #{}", mrIid);
     }
 
@@ -123,6 +125,8 @@ public class GitLabWebhookService {
         String repoUrl = payload.path("project").path("web_url").asText();
 
         log.info("Started AI Code Review for Push Commit: {}", commitSha);
+
+        //  this will now block the thread until ingestion is 100% complete
         checkAndIngestRepo(repoUrl);
 
         GitLabApi gitLabApi = new GitLabApi(gitlabUrl, gitlabToken);
@@ -138,7 +142,7 @@ public class GitLabWebhookService {
 
         String diffString = diffBuilder.toString();
 
-        //  pass the raw List<Diff> to the context search instead of the String
+        //  we are guaranteed to have database chunks now
         String relatedContext = getRelatedCodebaseContext(diffs, repoUrl);
 
         //  pass both the context and the diff to the AI
@@ -215,17 +219,52 @@ public class GitLabWebhookService {
     }
 
     /**
-     * checks if the repository exists in pgvector, triggers ingestion if missing
+     * checks if the repository exists in pgvector. if missing, triggers ingestion and actively waits for it to complete.
      *
      * @param repoUrl
      */
     private void checkAndIngestRepo(String repoUrl) {
-        if (chunkRepository.findByRepoUrl(repoUrl) == null) {
-            log.info("Repo not found in pgvector. Triggering ingestion...");
+        List<CodeChunk> initialCheck = chunkRepository.findByRepoUrl(repoUrl);
+
+        // check if list is empty, because JPA never returns null for lists
+        if (initialCheck == null || initialCheck.isEmpty()) {
+            log.info("Repo not found in pgvector. Triggering ingestion and waiting for completion...");
             ingestionService.ingestRepositoryAsync(
-                    RepoIngestionRequestDto.builder().repoUrl(repoUrl).build(),
+                    RepoIngestionRequestDto.builder()
+                            .repoUrl(repoUrl)
+                            .repoUsername("oauth2")
+                            .repoAccessToken(gitlabToken)
+                            .build(),
                     UUID.randomUUID().toString()
             );
+
+            int attempts = 0;
+            int maxAttempts = 120; // 10 minute timeout
+
+            // Loop infinitely up to maxAttempts
+            while (attempts < maxAttempts) {
+                try {
+                    Thread.sleep(5000);
+                    attempts++;
+
+                    // RE-QUERY the database inside the loop
+                    List<CodeChunk> currentChunks = chunkRepository.findByRepoUrl(repoUrl);
+
+                    // IF chunks finally exist, break the loop and proceed to the AI review!
+                    if (currentChunks != null && !currentChunks.isEmpty()) {
+                        log.info("Ingestion verified! Found {} chunks in database. Proceeding to Vector Search.", currentChunks.size());
+                        break;
+                    }
+
+                    if (attempts % 6 == 0) {
+                        log.info("Still waiting for repository ingestion to finish... ({} seconds elapsed)", attempts * 5);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.error("Thread was interrupted while waiting for ingestion", e);
+                    break;
+                }
+            }
         }
     }
 
@@ -238,17 +277,35 @@ public class GitLabWebhookService {
      */
     private String performAiCodeReview(String gitDiff, String context) {
         String prompt = """
-            You are an Expert Senior Software Engineer conducting a thorough Code Review.
+            You are a Principal Software Engineer and Security Architect conducting an exhaustive, in-depth Code Review.
             You are provided with a Git Diff representing the latest changes, AND a Context block containing related files from the broader codebase.
             
-            INSTRUCTIONS:
-            1. Analyze the Git Diff to understand the changes made.
-            2. Use the provided codebase CONTEXT to evaluate the impact of these changes on the rest of the application.
-            3. Identify critical bugs, breaking changes, security vulnerabilities, or architectural issues caused by this diff.
-            4. If a change in the diff breaks a method or logic in the related context, explain WHY.
-            5. If the code is safe and does not negatively impact the related context, reply EXACTLY with: "LGTM! No critical issues found."
-            6. Do not nitpick formatting. Keep it concise.
+            INSTRUCTIONS FOR DEEP ANALYSIS:
+            1. Analyze Intent & Mechanics: Carefully analyze the Git Diff to fully understand the logic, intent, and execution of the changes.
+            2. Repository-Wide Context: Cross-reference the Diff with the provided RELATED CODEBASE CONTEXT. Determine exactly how this change interacts with existing services, controllers, repositories, or utilities.
+            3. Vulnerabilities & Bugs: Look for critical logic flaws, security vulnerabilities (e.g., SQL injection, broken access control), and severe performance bottlenecks (e.g., N+1 queries, memory leaks, infinite loops).
+            4. Blast Radius & Dependent Files: If this change alters a method signature, changes database behavior, or modifies shared logic, you MUST explicitly list the exact file paths from the CONTEXT that will break or be negatively impacted.
+            5. Be Informational & Thorough: Do not just point out the error. Explain the underlying mechanics of WHY it is an error, what the runtime consequence will be, and how it affects the system architecture.
+            6. If the code is mathematically, logically, and structurally sound, and does not negatively impact the related context, reply EXACTLY with: "LGTM! No critical issues found."
             
+            FORMAT YOUR RESPONSE USING THIS EXACT MARKDOWN STRUCTURE (If issues are found):
+            
+            ### Summary of Changes
+            [Provide a detailed, technical explanation of what the developer changed.]
+            
+            ### Critical Issues & Vulnerabilities
+            [List severe bugs or security flaws. Explain the mechanics of the failure in depth.]
+            
+            ### Blast Radius (Affected Files)
+            [List the exact file paths of dependent classes/interfaces from the context that will fail, compile error, or behave incorrectly due to this change. Explain exactly how they are impacted.]
+            
+            ### Performance & Architectural Impact
+            [Discuss any N+1 query problems, memory issues, or architectural anti-patterns introduced.]
+            
+            ### Actionable Recommendations
+            [Provide the exact code snippets or architectural refactoring needed to safely fix the issues.]
+            
+            --------------------------------------------------
             RELATED CODEBASE CONTEXT:
             %s
             
