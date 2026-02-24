@@ -33,6 +33,7 @@ public class SecurityConfiguration {
                     registry.requestMatchers("api/v1/auth/status").permitAll();
                     registry.requestMatchers("api/v1/auth/register").permitAll();
                     registry.requestMatchers("api/v1/auth/login").permitAll();
+                    registry.requestMatchers("api/v1/webhook/gitlab").permitAll();
                     registry.anyRequest().authenticated();
                 })
                 .sessionManagement(

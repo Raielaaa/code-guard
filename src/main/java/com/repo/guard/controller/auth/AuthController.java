@@ -27,16 +27,29 @@ public class AuthController {
     private JwtService jwtService;
     private ModelMapper modelMapper;
 
+    /**
+     * checks the health and status of the authentication system
+     *
+     * @return
+     */
     @GetMapping("/status")
     public ResponseEntity<ApiResponse> getSystemStatus() {
+        //  return a simple ok response indicating the system is up
         return ResponseEntity.ok().body(new ApiResponse(
                 "Ok",
                 "Systems up"
         ));
     }
 
+    /**
+     * registers a new user into the system with encoded credentials
+     *
+     * @param requestDto
+     * @return
+     */
     @PostMapping("/register")
     public ResponseEntity<ApiResponse> registerUser(@RequestBody RequestDto requestDto) {
+        //  build and save the user model, ensuring the password is safely encoded
         return ResponseEntity.ok().body(new ApiResponse(
                 "User created",
                 modelMapper.map(userService.saveUser(
@@ -50,8 +63,15 @@ public class AuthController {
         ));
     }
 
+    /**
+     * authenticates user credentials and returns a generated jwt token if successful
+     *
+     * @param loginForm
+     * @return
+     */
     @PostMapping("/login")
     public String authenticateAndGetToken(@RequestBody LoginForm loginForm) {
+        //  attempt to authenticate the provided username and password combination
         Authentication authentication = authenticationManager.authenticate(
                 new UsernamePasswordAuthenticationToken(
                         loginForm.getUsername(),
@@ -59,9 +79,11 @@ public class AuthController {
                 )
         );
 
+        //  if authentication is successful, generate and return the jwt token
         if (authentication.isAuthenticated()) {
             return jwtService.generateToken(userService.loadUserByUsername(loginForm.getUsername()));
         } else {
+            //  throw an exception if the credentials do not match
             throw new UsernameNotFoundException("Invalid user request.");
         }
     }

@@ -29,7 +29,7 @@ public interface CodeChunkRepository extends JpaRepository<CodeChunk, UUID> {
             """, nativeQuery = true)
     List<CodeChunk> findSimilarChunksByRepo(float[] embedding, int limit, String repoUrl);
 
-    List<CodeChunk> findAllByRepoUrl(String repoUrl);
+    List<CodeChunk> findByRepoUrl(String repoUrl);
 
     @Transactional
     void deleteByRepoUrl(String repoUrl);
