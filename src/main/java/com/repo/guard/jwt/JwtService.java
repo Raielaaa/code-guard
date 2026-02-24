@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 
 @Service
 public class JwtService {
-    @Value("${SECRET_KEY}")
+    @Value("${jwt.secret}")
     private String SECRET_KEY;
 
     private static final Long VALIDITY_IN_MS = TimeUnit.MINUTES.toMillis(30);

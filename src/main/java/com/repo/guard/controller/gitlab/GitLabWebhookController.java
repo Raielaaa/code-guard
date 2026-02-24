@@ -41,8 +41,8 @@ public class GitLabWebhookController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid Token");
         }
 
-        //  we only care about merge request events; ignore pushes, pipelines, etc.
-        if (!"Merge Request Hook".equals(eventType)) {
+        //  accept both merge request hooks and push hooks (commits)
+        if (!"Merge Request Hook".equals(eventType) && !"Push Hook".equals(eventType)) {
             return ResponseEntity.ok("Ignored: Not a Merge Request event");
         }
 
