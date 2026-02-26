@@ -6,6 +6,7 @@ import com.repo.guard.model.repo.CodeChunkRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.Git;
+import org.gitlab4j.api.GitLabApi;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
@@ -15,10 +16,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.FileSystemUtils;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Stream;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 
@@ -69,6 +73,89 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
             //  ensure that the temporary directory used for cloning the repo is deleted after processing to free up disk space,
             //  even if errors occurred
             FileSystemUtils.deleteRecursively(tempDir);
+        }
+    }
+
+    @Async
+    public void syncDeltaAsync(
+            Integer projectId,
+            String repoUrl,
+            String gitlabUrl,
+            String gitlabToken,
+            String branch,
+            Set<String> filesToUpdate,
+            Set<String> filesToDelete
+    ) {
+        log.info("Starting Delta Sync for {} update(s) and {} deletion(s)...", filesToUpdate.size(), filesToDelete.size());
+
+        // 1. DELETE OLD VECTORS (for both modified and deleted files)
+        transactionTemplate.execute(status -> {
+            for (String file : filesToDelete) {
+                codeChunkRepository.deleteByRepoUrlAndFilePathStartingWith(repoUrl, file);
+            }
+            for (String file : filesToUpdate) {
+                codeChunkRepository.deleteByRepoUrlAndFilePathStartingWith(repoUrl, file);
+            }
+            return null;
+        });
+
+        if (filesToUpdate.isEmpty()) return;
+
+        // 2. FETCH & EMBED ONLY THE CHANGED FILES
+        GitLabApi gitLabApi = new GitLabApi(gitlabUrl, gitlabToken);
+
+        String safeRef = branch;
+        try {
+            // The getBranch API properly encodes slashes. We use it to grab the raw SHA hash.
+            safeRef = gitLabApi.getRepositoryApi().getBranch(projectId, branch).getCommit().getId();
+            log.info("Successfully resolved branch '{}' to commit SHA: {}", branch, safeRef);
+        } catch (Exception e) {
+            // If 'branch' is already a SHA (or if it fails), this catch block safely ignores it
+            log.warn("Could not resolve branch to SHA. Proceeding with raw ref: {}", safeRef);
+        }
+
+        List<CodeChunk> newChunks = new ArrayList<>();
+
+        for (String filePath : filesToUpdate) {
+            // Skip binaries
+            if (filePath.endsWith(".png") || filePath.endsWith(".jpg") || filePath.endsWith(".jar") || filePath.endsWith(".class")) continue;
+
+            try {
+                // Download the raw file directly into memory using GitLab's API
+                // read the InputStream and convert it to a UTF-8 String
+                String content = "";
+                try (InputStream inputStream = gitLabApi.getRepositoryFileApi().getRawFile(projectId, filePath, safeRef)) {
+                    content = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
+                }
+
+                if (content == null || content.isBlank()) continue;
+
+                Document sourceDoc = new Document(content);
+                List<Document> splitDocs = textSplitter.apply(List.of(sourceDoc));
+
+                for (int i = 0; i < splitDocs.size(); i++) {
+                    String displayPath = filePath;
+                    if (splitDocs.size() > 1) displayPath += " (Part " + (i + 1) + "/" + splitDocs.size() + ")";
+
+                    CodeChunk chunk = CodeChunk.builder()
+                            .repoUrl(repoUrl)
+                            .filePath(displayPath)
+                            .content(splitDocs.get(i).getText())
+                            .build();
+
+                    // Use our robust retry method!
+                    chunk.setEmbedding(generateEmbeddingWithRetry(chunk.getContent(), i, 3));
+                    newChunks.add(chunk);
+                }
+            } catch (Exception e) {
+                log.error("Delta Sync: Failed to fetch or embed file: " + filePath, e);
+            }
+        }
+
+        // 3. SAVE TO DB
+        if (!newChunks.isEmpty()) {
+            codeChunkRepository.saveAll(newChunks);
+            log.info("Delta Sync complete! Inserted {} new vectors.", newChunks.size());
         }
     }
 
@@ -208,6 +295,8 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     /**
      * generates embeddings for each code chunk sequentially, utilizing a warmup
      * and optimistic execution backed by exponential backoff.
+     *
+     * * @param chunksToInsert
      */
     private void generateEmbeddings(List<CodeChunk> chunksToInsert) {
         log.info("Parsed {} chunks. Generating embeddings...", chunksToInsert.size());
@@ -215,6 +304,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
         //  warm up the model with a test embedding to ensure it's fully loaded into unified memory
         try {
             log.info("Warming up embedding model...");
+            //  this initial call may take extra time as it loads the model, but it helps ensure subsequent calls are faster and more consistent
             embeddingModel.embed("model warmup test");
             log.info("Model warmup complete.");
         } catch (Exception e) {
@@ -231,35 +321,51 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
             float[] vector = generateEmbeddingWithRetry(chunk.getContent(), i, 3);
             chunk.setEmbedding(vector);
 
+            //  log progress every batchSize chunks to provide visibility into the embedding generation process
             if (i > 0 && i % batchSize == 0) {
                 log.info("Processed {}/{} chunks...", i, chunksToInsert.size());
             }
         }
     }
 
+    /**
+     * generates an embedding for the given content with an exponential backoff retry mechanism
+     * to handle transient failures from the embedding model
+     *
+     * @param content
+     * @param chunkIndex
+     * @param maxRetries
+     * @return
+     */
     private float[] generateEmbeddingWithRetry(String content, int chunkIndex, int maxRetries) {
         int attempt = 0;
         Exception lastException = null;
-        
+
+        //  loop until successful or max retries are reached
         while (attempt < maxRetries) {
             try {
+                //  attempt to generate the embedding using the model
                 return embeddingModel.embed(content);
             } catch (Exception err) {
                 lastException = err;
                 attempt++;
-                
+
+                //  if we haven't reached max retries, calculate wait time and pause before retrying
                 if (attempt < maxRetries) {
                     int waitTime = 5000 * attempt;
                     log.warn("Embedding generation failed for chunk {}, attempt {}/{}. Waiting {}ms before retry...", chunkIndex, attempt, maxRetries, waitTime);
                     try {
+                        //  pause the thread for the calculated wait time
                         Thread.sleep(waitTime);
                     } catch (InterruptedException ie) {
+                        //  restore the interrupted status
                         Thread.currentThread().interrupt();
                     }
                 }
             }
         }
-        
+
+        //  if all retries fail, throw an exception with the last encountered error
         throw new RuntimeException("Failed to generate embedding after " + maxRetries + " attempts", lastException);
     }
 

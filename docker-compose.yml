@@ -7,19 +7,20 @@ services:
     env_file:
       - .env
     environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
       - GITLAB_WEBHOOK_SECRET=${GITLAB_WEBHOOK_SECRET}
       - SPRING_DATASOURCE_URL=jdbc:postgresql://guard-postgres:5432/guard_db
       - SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME}
       - SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD}
       - SPRING_DATA_REDIS_HOST=guard-redis
-#      - SPRING_AI_OLLAMA_BASE_URL=http://guard-ollama:11434
-      - SPRING_AI_OLLAMA_BASE_URL=http://host.docker.internal:11434
     depends_on:
       - postgres
       - redis
 #      - ollama
     restart: no
+    extra_hosts:
+      - "gitlab2.mynt.xyz:172.26.206.122"
   postgres:
     image: pgvector/pgvector:pg16
     container_name: guard-postgres

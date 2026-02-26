@@ -1,7 +1,9 @@
 package com.repo.guard.model.repo;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
@@ -24,7 +26,7 @@ public interface CodeChunkRepository extends JpaRepository<CodeChunk, UUID> {
     @Query(value = """
             SELECT * FROM code_chunks 
             WHERE repo_url = ?3 
-            ORDER BY embedding <=> cast(?1 as vector) 
+            ORDER BY embedding <=> cast(?1 as vector)
             LIMIT ?2
             """, nativeQuery = true)
     List<CodeChunk> findSimilarChunksByRepo(float[] embedding, int limit, String repoUrl);
@@ -33,4 +35,9 @@ public interface CodeChunkRepository extends JpaRepository<CodeChunk, UUID> {
 
     @Transactional
     void deleteByRepoUrl(String repoUrl);
+
+    // This allows us to delete "File.java", "File.java (Part 1/2)", etc.
+    @Modifying
+    @Query("DELETE FROM CodeChunk c WHERE c.repoUrl = :repoUrl AND c.filePath LIKE CONCAT(:filePath, '%')")
+    void deleteByRepoUrlAndFilePathStartingWith(@Param("repoUrl") String repoUrl, @Param("filePath") String filePath);
 }
