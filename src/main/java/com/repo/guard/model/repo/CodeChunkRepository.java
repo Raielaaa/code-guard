@@ -36,8 +36,8 @@ public interface CodeChunkRepository extends JpaRepository<CodeChunk, UUID> {
     @Transactional
     void deleteByRepoUrl(String repoUrl);
 
-    // This allows us to delete "File.java", "File.java (Part 1/2)", etc.
-    @Modifying
-    @Query("DELETE FROM CodeChunk c WHERE c.repoUrl = :repoUrl AND c.filePath LIKE CONCAT(:filePath, '%')")
+    @Transactional
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = "DELETE FROM code_chunks WHERE repo_url = :repoUrl AND file_path LIKE CONCAT(:filePath, '%')", nativeQuery = true)
     void deleteByRepoUrlAndFilePathStartingWith(@Param("repoUrl") String repoUrl, @Param("filePath") String filePath);
 }

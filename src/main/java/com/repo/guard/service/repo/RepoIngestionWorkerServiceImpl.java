@@ -6,7 +6,6 @@ import com.repo.guard.model.repo.CodeChunkRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.Git;
-import org.gitlab4j.api.GitLabApi;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
@@ -16,8 +15,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.FileSystemUtils;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -76,6 +73,20 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
         }
     }
 
+    /**
+     * performs a delta sync by cloning only the target branch, reading the changed files,
+     * generating embeddings, and updating the corresponding vectors in the database.
+     * uses a shallow JGit clone instead of the GitLab Repository Files API for reliability
+     * on self-hosted GitLab instances.
+     *
+     * @param projectId
+     * @param repoUrl
+     * @param gitlabUrl
+     * @param gitlabToken
+     * @param branch
+     * @param filesToUpdate
+     * @param filesToDelete
+     */
     @Async
     public void syncDeltaAsync(
             Integer projectId,
@@ -88,7 +99,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     ) {
         log.info("Starting Delta Sync for {} update(s) and {} deletion(s)...", filesToUpdate.size(), filesToDelete.size());
 
-        // 1. DELETE OLD VECTORS (for both modified and deleted files)
+        //  delete old vectors only for the specific modified and deleted files
         transactionTemplate.execute(status -> {
             for (String file : filesToDelete) {
                 codeChunkRepository.deleteByRepoUrlAndFilePathStartingWith(repoUrl, file);
@@ -101,61 +112,88 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
 
         if (filesToUpdate.isEmpty()) return;
 
-        // 2. FETCH & EMBED ONLY THE CHANGED FILES
-        GitLabApi gitLabApi = new GitLabApi(gitlabUrl, gitlabToken);
+        //  shallow clone the target branch via JGit and read only the changed files
+        File tempDir = new File(System.getProperty("java.io.tmpdir"), "guard-delta/" + System.currentTimeMillis());
 
-        String safeRef = branch;
         try {
-            // The getBranch API properly encodes slashes. We use it to grab the raw SHA hash.
-            safeRef = gitLabApi.getRepositoryApi().getBranch(projectId, branch).getCommit().getId();
-            log.info("Successfully resolved branch '{}' to commit SHA: {}", branch, safeRef);
-        } catch (Exception e) {
-            // If 'branch' is already a SHA (or if it fails), this catch block safely ignores it
-            log.warn("Could not resolve branch to SHA. Proceeding with raw ref: {}", safeRef);
-        }
+            //  create the credentials provider using the token for JGit authentication
+            UsernamePasswordCredentialsProvider credentialsProvider =
+                    new UsernamePasswordCredentialsProvider("oauth2", gitlabToken);
 
-        List<CodeChunk> newChunks = new ArrayList<>();
+            //  if the temp directory already exists, delete it first to avoid conflicts
+            if (tempDir.exists()) FileSystemUtils.deleteRecursively(tempDir);
 
-        for (String filePath : filesToUpdate) {
-            // Skip binaries
-            if (filePath.endsWith(".png") || filePath.endsWith(".jpg") || filePath.endsWith(".jar") || filePath.endsWith(".class")) continue;
+            log.info("Cloning branch '{}' for Delta Sync...", branch);
 
-            try {
-                // Download the raw file directly into memory using GitLab's API
-                // read the InputStream and convert it to a UTF-8 String
-                String content = "";
-                try (InputStream inputStream = gitLabApi.getRepositoryFileApi().getRawFile(projectId, filePath, safeRef)) {
-                    content = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
+            //  shallow clone (depth=1) of only the target branch to minimize data transfer
+            Git.cloneRepository()
+                    .setURI(repoUrl)
+                    .setDirectory(tempDir)
+                    .setBranchesToClone(List.of("refs/heads/" + branch))
+                    .setBranch("refs/heads/" + branch)
+                    .setDepth(1)
+                    .setCredentialsProvider(credentialsProvider)
+                    .call()
+                    .close();
+
+            List<CodeChunk> newChunks = new ArrayList<>();
+
+            //  read, split, and embed only the files that were changed in the merge request
+            for (String filePath : filesToUpdate) {
+                if (filePath.endsWith(".png") || filePath.endsWith(".jpg") || filePath.endsWith(".jar") || filePath.endsWith(".class")) continue;
+
+                try {
+                    //  resolve the file path within the cloned temp directory
+                    Path localFile = tempDir.toPath().resolve(filePath);
+
+                    //  if the file doesn't exist in the clone (e.g., deleted or renamed), skip it but log a warning
+                    if (!Files.exists(localFile)) {
+                        log.warn("Delta Sync: File not found in clone: {}", filePath);
+                        continue;
+                    }
+
+                    //  read the file content as a string
+                    String content = Files.readString(localFile);
+                    if (content == null || content.isBlank()) continue;
+
+                    //  wrap raw content and split into smaller chunks using the text splitter
+                    Document sourceDoc = new Document(content);
+                    List<Document> splitDocs = textSplitter.apply(List.of(sourceDoc));
+
+                    //  process each split part, generate embedding, and prepare it for db insertion
+                    for (int i = 0; i < splitDocs.size(); i++) {
+                        String displayPath = filePath;
+                        //  if the original file was split into multiple chunks,
+                        //  append a part indicator to the display path to differentiate them in the database
+                        //  and during retrieval
+                        if (splitDocs.size() > 1) displayPath += " (Part " + (i + 1) + "/" + splitDocs.size() + ")";
+
+                        //  create a new code chunk for this split part with the repo URL, display path, and chunk content
+                        CodeChunk chunk = CodeChunk.builder()
+                                .repoUrl(repoUrl)
+                                .filePath(displayPath)
+                                .content(splitDocs.get(i).getText())
+                                .build();
+
+                        //  generate embedding vector for the chunk content with retry logic and set it on the chunk
+                        chunk.setEmbedding(generateEmbeddingWithRetry(chunk.getContent(), i, 3));
+                        newChunks.add(chunk);
+                    }
+                } catch (Exception e) {
+                    log.error("Delta Sync: Failed to process file: " + filePath, e);
                 }
-
-                if (content == null || content.isBlank()) continue;
-
-                Document sourceDoc = new Document(content);
-                List<Document> splitDocs = textSplitter.apply(List.of(sourceDoc));
-
-                for (int i = 0; i < splitDocs.size(); i++) {
-                    String displayPath = filePath;
-                    if (splitDocs.size() > 1) displayPath += " (Part " + (i + 1) + "/" + splitDocs.size() + ")";
-
-                    CodeChunk chunk = CodeChunk.builder()
-                            .repoUrl(repoUrl)
-                            .filePath(displayPath)
-                            .content(splitDocs.get(i).getText())
-                            .build();
-
-                    // Use our robust retry method!
-                    chunk.setEmbedding(generateEmbeddingWithRetry(chunk.getContent(), i, 3));
-                    newChunks.add(chunk);
-                }
-            } catch (Exception e) {
-                log.error("Delta Sync: Failed to fetch or embed file: " + filePath, e);
             }
-        }
 
-        // 3. SAVE TO DB
-        if (!newChunks.isEmpty()) {
-            codeChunkRepository.saveAll(newChunks);
-            log.info("Delta Sync complete! Inserted {} new vectors.", newChunks.size());
+            //  save the new vectors for only the changed files to the database
+            if (!newChunks.isEmpty()) {
+                codeChunkRepository.saveAll(newChunks);
+                log.info("Delta Sync complete! Inserted {} new vectors.", newChunks.size());
+            }
+        } catch (Exception e) {
+            log.error("Delta Sync: Failed to clone repository for delta update", e);
+        } finally {
+            //  always clean up the temp directory to free disk space
+            FileSystemUtils.deleteRecursively(tempDir);
         }
     }
 
@@ -213,7 +251,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
         Git.cloneRepository()
                 .setURI(repo.getRepoUrl())
                 .setDirectory(tempDir)
-                .setCredentialsProvider(credentialsProvider) // <-- THIS IS THE CRITICAL FIX
+                .setCredentialsProvider(credentialsProvider)
                 .call();
     }
 
@@ -274,7 +312,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
                     Document splitPart = splitDocs.get(i);
 
                     //  create a display path for the chunk by removing the temp directory prefix
-                    String displayPath = path.toString().replace(tempDir.getAbsolutePath(), "");
+                    String displayPath = tempDir.toPath().relativize(path).toString().replace("\\", "/");
                     //  if the original file was split into multiple chunks, append a part indicator to the display path
                     if (splitDocs.size() > 1) displayPath += " (Part " + (i + 1) + "/" + splitDocs.size() + ")";
 

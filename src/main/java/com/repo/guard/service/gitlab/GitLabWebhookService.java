@@ -11,8 +11,10 @@ import org.gitlab4j.api.GitLabApi;
 import org.gitlab4j.api.models.Diff;
 import org.gitlab4j.api.models.MergeRequest;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.prompt.PromptTemplate;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.Resource;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.ai.document.Document;
@@ -31,11 +33,15 @@ public class GitLabWebhookService {
     //  instantiate the spring ai text splitter to intelligently chunk large diffs without breaking words
     private final TokenTextSplitter textSplitter = new TokenTextSplitter(512, 100, 10, 50, true);
 
+    //  pull GitLab API credentials from application properties
     @Value("${gitlab.api.url}")
     private String gitlabUrl;
-
+    //  pull the GitLab API token from application properties to authenticate API calls for fetching diffs and posting comments
     @Value("${gitlab.api.token}")
     private String gitlabToken;
+    //  pull the code review prompt template from the classpath resources
+    @Value("classpath:/static/code-review.st")
+    private Resource codeReviewPromptResource;
 
     /**
      * routes the incoming gitlab event to the appropriate review logic based on its kind
@@ -54,9 +60,9 @@ public class GitLabWebhookService {
                 handleMergeRequest(payload);
             }
             //  route to direct commit/push logic
-            else if ("push".equals(objectKind)) {
-                handlePushEvent(payload);
-            }
+//            else if ("push".equals(objectKind)) {
+//                handlePushEvent(payload);
+//            }
 
         } catch (Exception e) {
             log.error("Failed to process GitLab Webhook", e);
@@ -78,47 +84,47 @@ public class GitLabWebhookService {
         String targetBranch = payload.path("object_attributes").path("target_branch").asText();
         String defaultBranch = payload.path("project").path("default_branch").asText();
 
-        // --- NEW CRITICAL FIX: Extract the exact immutable commit SHA of the merge ---
-        String mergeCommitSha = payload.path("object_attributes").path("merge_commit_sha").asText();
-
-        // Fallback to the branch name just in case the SHA is missing from the payload
-        String fetchRef = (mergeCommitSha != null && !mergeCommitSha.isBlank() && !"null".equals(mergeCommitSha))
-                ? mergeCommitSha
-                : targetBranch;
-
         GitLabApi gitLabApi = new GitLabApi(gitlabUrl, gitlabToken);
 
         // =================================================================================
         // SCENARIO 1: MR IS APPROVED & MERGED (Trigger Delta Sync)
         // =================================================================================
         if ("merge".equals(action)) {
-            // Ensure we only update the DB if it's merging into the main/master branch
+            //  only update the DB if it's merging into the main/default branch
             boolean isTargetingDefault = defaultBranch != null && targetBranch.equals(defaultBranch);
 
             if (isTargetingDefault) {
-                log.info("Merge Request #{} successfully merged into main! Triggering Delta Sync...", mrIid);
+                log.info("Merge Request #{} successfully merged into {}! Triggering Delta Sync...", mrIid, defaultBranch);
 
                 MergeRequest mrWithChanges = gitLabApi.getMergeRequestApi().getMergeRequestChanges(projectId, mrIid);
+
+                //  use the default branch name as the ref for cloning during delta sync,
+                //  since it always points to the latest merged content
+                String refForDeltaSync = defaultBranch;
 
                 Set<String> filesToUpdate = new HashSet<>();
                 Set<String> filesToDelete = new HashSet<>();
 
-                // Parse the approved diffs to figure out exactly what was added/removed
+                //  parse the approved diffs to figure out exactly what was added/removed
                 if (mrWithChanges.getChanges() != null) {
                     for (Diff diff : mrWithChanges.getChanges()) {
                         if (Boolean.TRUE.equals(diff.getDeletedFile())) {
                             filesToDelete.add(diff.getOldPath());
                         } else if (Boolean.TRUE.equals(diff.getRenamedFile())) {
-                            filesToDelete.add(diff.getOldPath()); // remove old vector
-                            filesToUpdate.add(diff.getNewPath()); // embed new vector
+                            filesToDelete.add(diff.getOldPath());
+                            filesToUpdate.add(diff.getNewPath());
                         } else {
                             filesToUpdate.add(diff.getNewPath());
                         }
                     }
                 }
 
-                // Fire the Delta Sync Worker!
-                ingestionService.syncDeltaAsync(projectId, repoUrl, gitlabUrl, gitlabToken, fetchRef, filesToUpdate, filesToDelete);
+                //  use the target project ID from the MR object to correctly handle forks
+                Long targetProjectIdLong = mrWithChanges.getTargetProjectId();
+                Integer targetProjectId = targetProjectIdLong != null ? targetProjectIdLong.intValue() : projectId;
+
+                //  fire the delta sync worker to update only the changed vectors
+                ingestionService.syncDeltaAsync(targetProjectId, repoUrl, gitlabUrl, gitlabToken, refForDeltaSync, filesToUpdate, filesToDelete);
             } else {
                 // Handles sub-feature branch merges (e.g., merging feature-2 into feature-1)
                 log.info("Merge Request #{} merged into a sub-branch ({}). Skipping Vector DB update to protect root context.", mrIid, targetBranch);
@@ -354,63 +360,20 @@ public class GitLabWebhookService {
      * @return
      */
     private String performAiCodeReview(String gitDiff, String context) {
-        String prompt = """
-            You are an elite Principal Software Engineer, Application Security Architect, and Context-Aware System Architect conducting an exhaustive Code Review.
-            Your primary focus is WHOLE-PROJECT AWARENESS. You are provided with a Git Diff AND a Context block containing related files from the broader codebase.
-            
-            INSTRUCTIONS FOR DEEP ANALYSIS:
-            1. WHOLE-CODEBASE AWARENESS (PRIMARY OBJECTIVE): Do not review the Git Diff in isolation. You MUST heavily cross-reference the Git Diff with the RELATED CODEBASE CONTEXT. Evaluate how the new changes interact with existing database schemas, service contracts, utility classes, and downstream consumers.
-            2. Analyze Intent & Mechanics: Carefully analyze the Git Diff to fully understand the logic, intent, and execution of the changes.
-            3. IGNORE NOISE: Do not comment on method reordering, whitespace changes, or formatting. Focus strictly on system-wide logic, security, and architecture.
-            4. RISK SCORING: You must assign an overall severity score to this PR based on the highest-severity issue found.
-               - CRITICAL: Immediate data breach, system crash, or severe financial loss risk. PR must be blocked.
-               - HIGH: Significant vulnerability (e.g., IDOR, SSRF) or major architectural/contract-breaking flaw.
-               - MEDIUM: Edge-case bugs, performance degradation, or missing error handling.
-               - LOW: Minor tech debt, code smells, or non-optimal patterns.
-               - SAFE: Mathematically, logically, and structurally sound.
-            5. SPECIFIC VULNERABILITY HUNT (OWASP Top 10): You MUST explicitly scan the code for:
-               - Injection Flaws (SQLi, Command Injection) and unsafe queries.
-               - Concurrency issues & Race Conditions (e.g., TOCTOU, missing locking in transactional boundaries).
-               - Hardcoded secrets, API keys, or sensitive credentials.
-               - Broken Access Control (IDOR, missing authorization checks).
-               - Server-Side Request Forgery (SSRF).
-            6. Blast Radius & Dependent Files: Explicitly list the exact file paths, methods, or interfaces from the CONTEXT that will break or behave incorrectly due to this diff. If the <related_context> is empty, explicitly state: "No surrounding context provided; analyzing diff in isolation."
-            7. If the code is perfectly SAFE, reply EXACTLY with: "### 🛡️ Overall Risk Assessment: **SAFE** \\n\\nLGTM! No critical issues found across the provided context. Excellent work."
-            
-            FORMAT YOUR RESPONSE USING THIS EXACT MARKDOWN STRUCTURE (If issues are found):
-            
-            ### Overall Risk Assessment: **[CRITICAL | HIGH | MEDIUM | LOW]**
-            
-            ### Summary of Changes
-            [Provide a highly technical explanation of what the developer changed. Skip formatting/whitespace changes.]
-            
-            ### Critical Issues & Vulnerabilities
-            [For each issue, start with a severity badge: **[CRITICAL]**, **[HIGH]**, or **[MEDIUM]**.]
-            [Name the vulnerability using OWASP/CWE terminology if applicable. Explain the mechanics of the failure in depth.]
-            
-            ### Blast Radius (Cross-File Impact)
-            [Relying heavily on the <related_context>, list the exact file paths, classes, and methods that are negatively impacted by this change. Explain how the contract or architecture was broken.]
-            
-            ### Performance & System-Wide Impact
-            [Discuss any concurrency issues, N+1 query problems, memory leaks, or architectural anti-patterns introduced to the broader system.]
-            
-            ### Actionable Recommendations
-            [Provide the exact code snippets or architectural refactoring needed to safely fix the critical issues. Ensure snippets are ready to be copy-pasted and fit the existing project context.]
-            
-            ### Additional Architectural Observations
-            [Optional: Place non-critical **[LOW]** suggestions here, such as DRY principle violations across the codebase, naming conventions, or future-proofing advice.]
-            
-            --------------------------------------------------
-            <related_context>
-            %s
-            </related_context>
-            
-            <git_diff>
-            %s
-            </git_diff>
-            """.formatted(context, gitDiff);
+        //  load the .st prompt template from resources
+        PromptTemplate promptTemplate = new PromptTemplate(codeReviewPromptResource);
 
-        return chatModel.call(prompt);
+        //  create a model map to pass both the diff and the context to the prompt template
+        Map<String, Object> model = Map.of(
+                "related_context", context,
+                "git_diff", gitDiff
+        );
+
+        //  render the final prompt by merging the template with the model
+        String renderedPrompt = promptTemplate.render(model);
+
+        //  call the chat model with the rendered prompt
+        return chatModel.call(renderedPrompt);
     }
 
     /**
