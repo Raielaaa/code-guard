@@ -10,6 +10,7 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
       - GITLAB_WEBHOOK_SECRET=${GITLAB_WEBHOOK_SECRET}
+      - GITLAB_API_URL=https://gitlab2.mynt.xyz
       - SPRING_DATASOURCE_URL=jdbc:postgresql://guard-postgres:5432/guard_db
       - SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME}
       - SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD}
@@ -20,8 +21,6 @@ services:
       - redis
 #      - ollama
     restart: no
-    extra_hosts:
-      - "gitlab2.mynt.xyz:172.26.206.122"
   postgres:
     image: pgvector/pgvector:pg16
     container_name: guard-postgres
