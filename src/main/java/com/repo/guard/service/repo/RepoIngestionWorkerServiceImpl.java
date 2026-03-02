@@ -7,8 +7,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.Git;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.embedding.EmbeddingModel;
-import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -29,10 +27,9 @@ import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerService {
     private final GitValidationService gitValidationService;
     private final CodeChunkRepository codeChunkRepository;
-    private final EmbeddingModel embeddingModel;
     private final TransactionTemplate transactionTemplate;
-    //  splitter that guarantees chunks are <= 512 tokens, with 300 token overlap, and a max of 10 splits per file
-    private final TokenTextSplitter textSplitter = new TokenTextSplitter(512, 300, 10, 50, true);
+    //  inject our new dedicated embedding facade instead of managing tokens here
+    private final VectorEmbeddingService vectorEmbeddingService;
 
     /**
      * ingests a repository asynchronously
@@ -53,31 +50,27 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
         try {
             //  clone the repository to the temp directory
             cloneRepository(repo, tempDir);
-            //  process the cloned files to extract code chunks and prepare them for embedding generation and db insertion
+            //  process the cloned files to extract code chunks
             List<CodeChunk> chunksToInsert = processFiles(tempDir, repo);
-            //  generate embeddings for each code chunk sequentially, with progress logging
-            generateEmbeddings(chunksToInsert);
-            //   perform a batch insert of all the processed chunks with their embeddings into the db
+            //  delegate the heavy lifting of mathematical embeddings to the dedicated service
+            vectorEmbeddingService.generateEmbeddingsForChunks(chunksToInsert);
+            //  perform a batch insert of all the processed chunks with their embeddings into the db
             saveToDatabase(repo, chunksToInsert);
 
             //  log completion of the job with the total number of chunks inserted into the database
             log.info("Job {} COMPLETED. Inserted {} vectors.", jobId, chunksToInsert.size());
         } catch (Exception err) {
-            //  log any exceptions that occur during the cloning, processing, embedding generation,
-            //  or db insertion steps to help with debugging and monitoring
+            //  log any exceptions that occur during the cloning or db insertion steps
             log.error("Job Failed", err);
         } finally {
-            //  ensure that the temporary directory used for cloning the repo is deleted after processing to free up disk space,
-            //  even if errors occurred
+            //  ensure that the temporary directory used for cloning the repo is deleted after processing
             FileSystemUtils.deleteRecursively(tempDir);
         }
     }
 
     /**
      * performs a delta sync by cloning only the target branch, reading the changed files,
-     * generating embeddings, and updating the corresponding vectors in the database.
-     * uses a shallow JGit clone instead of the GitLab Repository Files API for reliability
-     * on self-hosted GitLab instances.
+     * generating embeddings, and updating the corresponding vectors in the database
      *
      * @param projectId
      * @param repoUrl
@@ -146,7 +139,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
                     //  resolve the file path within the cloned temp directory
                     Path localFile = tempDir.toPath().resolve(filePath);
 
-                    //  if the file doesn't exist in the clone (e.g., deleted or renamed), skip it but log a warning
+                    //  if the file doesn't exist in the clone skip it but log a warning
                     if (!Files.exists(localFile)) {
                         log.warn("Delta Sync: File not found in clone: {}", filePath);
                         continue;
@@ -156,27 +149,23 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
                     String content = Files.readString(localFile);
                     if (content == null || content.isBlank()) continue;
 
-                    //  wrap raw content and split into smaller chunks using the text splitter
-                    Document sourceDoc = new Document(content);
-                    List<Document> splitDocs = textSplitter.apply(List.of(sourceDoc));
+                    //  delegate the chunking logic to the external embedding service
+                    List<Document> splitDocs = vectorEmbeddingService.splitText(content);
 
-                    //  process each split part, generate embedding, and prepare it for db insertion
+                    //  process each split part and prepare it for db insertion
                     for (int i = 0; i < splitDocs.size(); i++) {
                         String displayPath = filePath;
-                        //  if the original file was split into multiple chunks,
                         //  append a part indicator to the display path to differentiate them in the database
-                        //  and during retrieval
                         if (splitDocs.size() > 1) displayPath += " (Part " + (i + 1) + "/" + splitDocs.size() + ")";
 
-                        //  create a new code chunk for this split part with the repo URL, display path, and chunk content
                         CodeChunk chunk = CodeChunk.builder()
                                 .repoUrl(repoUrl)
                                 .filePath(displayPath)
                                 .content(splitDocs.get(i).getText())
                                 .build();
 
-                        //  generate embedding vector for the chunk content with retry logic and set it on the chunk
-                        chunk.setEmbedding(generateEmbeddingWithRetry(chunk.getContent(), i, 3));
+                        //  delegate embedding generation to the facade
+                        chunk.setEmbedding(vectorEmbeddingService.generateEmbeddingWithRetry(chunk.getContent(), i, 3));
                         newChunks.add(chunk);
                     }
                 } catch (Exception e) {
@@ -198,7 +187,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     }
 
     /**
-     * validates the repository by checking its existence and accessibility using the GitValidationService before attempting to clone it
+     * validates the repository by checking its existence and accessibility
      *
      * @param repo
      * @param jobId
@@ -224,23 +213,19 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     }
 
     /**
-     * clones the repository into a specified temporary directory using JGit,
-     * ensuring that any existing directory is cleared first to avoid conflicts
+     * clones the repository into a specified temporary directory using JGit
      *
      * @param repo
      * @param tempDir
      * @throws Exception
      */
     private void cloneRepository(RepoIngestionRequestDto repo, File tempDir) throws Exception {
-        //  clone the repo into the temp directory
         log.info("Cloning repo to: {}", tempDir.getAbsolutePath());
 
         //  if the temp directory already exists, delete it first to avoid conflicts
         if (tempDir.exists()) FileSystemUtils.deleteRecursively(tempDir);
 
         //  create the credentials provider using the token
-        //  note: gitlab requires the username to be non-empty, but it ignores the actual
-        //  username string as long as the password is a valid personal access token.
         UsernamePasswordCredentialsProvider credentialsProvider =
                 new UsernamePasswordCredentialsProvider(
                         repo.getRepoUsername() != null ? repo.getRepoUsername() : "oauth2",
@@ -256,8 +241,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     }
 
     /**
-     * processes the cloned repository files by walking through all files in the temp directory,
-     * filtering for relevant file types
+     * processes the cloned repository files by walking through all files in the temp directory
      *
      * @param tempDir
      * @param repo
@@ -269,7 +253,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
 
         //  walk through all files in the cloned repo including subdirectories
         try (Stream<Path> paths = Files.walk(tempDir.toPath())) {
-            //  filter to only include regular files with specific extensions (e.g., .java, .kt, .md, .gradle.kts)
+            //  filter to only include regular files with specific extensions
             paths.filter(Files::isRegularFile)
                     .filter(path -> {
                         String p = path.toString();
@@ -278,11 +262,9 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
                                 || p.endsWith(".md")
                                 || p.endsWith(".gradle.kts");
                     })
-                    //  for each relevant file, process it to extract code chunks and prepare them
-                    //  for embedding generation and db insertion
+                    //  for each relevant file, process it to extract code chunks
                     .forEach(path -> processSingleFile(path, tempDir, repo, chunksToInsert));
         } catch (IOException err) {
-            //  throw runtime exception to trigger the outer catch block
             log.error("Failed to walk through files in the cloned repository.", err);
             throw new RuntimeException(err);
         }
@@ -290,7 +272,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     }
 
     /**
-     * processes a single file by reading its content, splitting it into smaller chunks using the text splitter
+     * processes a single file by reading its content and delegating splitting to the embedding service
      *
      * @param path
      * @param tempDir
@@ -302,10 +284,9 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
             //  read the file content as a string
             String content = Files.readString(path);
             if (!content.isBlank()) {
-                //  wrap raw content
-                Document sourceDoc = new Document(content);
-                //  split the document into smaller parts using the text splitter
-                List<Document> splitDocs = textSplitter.apply(List.of(sourceDoc));
+
+                //  delegate the chunking logic to the external embedding service
+                List<Document> splitDocs = vectorEmbeddingService.splitText(content);
 
                 //  process each split part and prepare it for db insertion
                 for (int i = 0; i < splitDocs.size(); i++) {
@@ -316,7 +297,7 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
                     //  if the original file was split into multiple chunks, append a part indicator to the display path
                     if (splitDocs.size() > 1) displayPath += " (Part " + (i + 1) + "/" + splitDocs.size() + ")";
 
-                    //  add the chunk to the list of chunks to insert, with repo URL, display path, and chunk content
+                    //  add the chunk to the list of chunks to insert
                     chunksToInsert.add(CodeChunk.builder()
                             .repoUrl(repo.getRepoUrl())
                             .filePath(displayPath)
@@ -325,90 +306,13 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
                 }
             }
         } catch (IOException err) {
-            //  show error but continue processing other files, as one failed file shouldn't stop the entire ingestion
+            //  show error but continue processing other files
             log.error("Failed to read file: " + path, err);
         }
     }
 
     /**
-     * generates embeddings for each code chunk sequentially, utilizing a warmup
-     * and optimistic execution backed by exponential backoff.
-     *
-     * * @param chunksToInsert
-     */
-    private void generateEmbeddings(List<CodeChunk> chunksToInsert) {
-        log.info("Parsed {} chunks. Generating embeddings...", chunksToInsert.size());
-
-        //  warm up the model with a test embedding to ensure it's fully loaded into unified memory
-        try {
-            log.info("Warming up embedding model...");
-            //  this initial call may take extra time as it loads the model, but it helps ensure subsequent calls are faster and more consistent
-            embeddingModel.embed("model warmup test");
-            log.info("Model warmup complete.");
-        } catch (Exception e) {
-            log.warn("Model warmup failed, continuing anyway", e);
-        }
-
-        int batchSize = 10;
-
-        //  process chunks optimistically. run as fast as possible and only delay if Ollama fails.
-        for (int i = 0; i < chunksToInsert.size(); i++) {
-            CodeChunk chunk = chunksToInsert.get(i);
-
-            //  generate embedding vector with our safety net
-            float[] vector = generateEmbeddingWithRetry(chunk.getContent(), i, 3);
-            chunk.setEmbedding(vector);
-
-            //  log progress every batchSize chunks to provide visibility into the embedding generation process
-            if (i > 0 && i % batchSize == 0) {
-                log.info("Processed {}/{} chunks...", i, chunksToInsert.size());
-            }
-        }
-    }
-
-    /**
-     * generates an embedding for the given content with an exponential backoff retry mechanism
-     * to handle transient failures from the embedding model
-     *
-     * @param content
-     * @param chunkIndex
-     * @param maxRetries
-     * @return
-     */
-    private float[] generateEmbeddingWithRetry(String content, int chunkIndex, int maxRetries) {
-        int attempt = 0;
-        Exception lastException = null;
-
-        //  loop until successful or max retries are reached
-        while (attempt < maxRetries) {
-            try {
-                //  attempt to generate the embedding using the model
-                return embeddingModel.embed(content);
-            } catch (Exception err) {
-                lastException = err;
-                attempt++;
-
-                //  if we haven't reached max retries, calculate wait time and pause before retrying
-                if (attempt < maxRetries) {
-                    int waitTime = 5000 * attempt;
-                    log.warn("Embedding generation failed for chunk {}, attempt {}/{}. Waiting {}ms before retry...", chunkIndex, attempt, maxRetries, waitTime);
-                    try {
-                        //  pause the thread for the calculated wait time
-                        Thread.sleep(waitTime);
-                    } catch (InterruptedException ie) {
-                        //  restore the interrupted status
-                        Thread.currentThread().interrupt();
-                    }
-                }
-            }
-        }
-
-        //  if all retries fail, throw an exception with the last encountered error
-        throw new RuntimeException("Failed to generate embedding after " + maxRetries + " attempts", lastException);
-    }
-
-    /**
-     * saves the processed code chunks with their embeddings to the database by performing a bulk insert within a transaction
+     * saves the processed code chunks with their embeddings to the database by performing a bulk insert
      *
      * @param repo
      * @param chunksToInsert
@@ -416,10 +320,10 @@ public class RepoIngestionWorkerServiceImpl implements RepoIngestionWorkerServic
     private void saveToDatabase(RepoIngestionRequestDto repo, List<CodeChunk> chunksToInsert) {
         //  perform a batch insert into the database
         transactionTemplate.execute(status -> {
-            //  before inserting new chunks, delete all existing chunks for this repo to avoid duplicates and ensure data consistency
+            //  before inserting new chunks, delete all existing chunks for this repo to avoid duplicates
             log.info("Clearing old vectors for repo: {}", repo.getRepoUrl());
             codeChunkRepository.deleteByRepoUrl(repo.getRepoUrl());
-            //  save all the new chunks with their embeddings to the database in a single batch operation for efficiency
+            //  save all the new chunks with their embeddings to the database
             codeChunkRepository.saveAll(chunksToInsert);
             return null;
         });
