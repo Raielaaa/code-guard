@@ -9,6 +9,7 @@ import org.gitlab4j.api.models.Diff;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 
@@ -16,6 +17,8 @@ import java.util.List;
 
 @Slf4j
 @Service
+//  only instantiate this bean if the property is set to 'true'. if missing, default to 'false'
+@ConditionalOnProperty(name = "guard.feature.push-review.enabled", havingValue = "true", matchIfMissing = false)
 public class PushEventHandler extends AbstractGitLabEventHandler {
     public PushEventHandler(
             ChatModel chatModel,
