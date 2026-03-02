@@ -2,7 +2,7 @@ package com.repo.guard.controller.gitlab;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.repo.guard.model.repo.CodeChunkRepository;
-import com.repo.guard.service.gitlab.GitLabWebhookService;
+import com.repo.guard.service.gitlab.WebhookService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,7 +16,7 @@ import org.springframework.web.bind.annotation.*;
 @RequestMapping(path = "/${gitlab.path}")
 public class GitLabWebhookController {
     private final CodeChunkRepository chunkRepository;
-    private final GitLabWebhookService webhookService;
+    private final WebhookService webhookService;
 
     //  pull the expected secret token from application properties to verify incoming webhooks
     @Value("${gitlab.webhook.secret}")
@@ -44,10 +44,10 @@ public class GitLabWebhookController {
 
         //  accept both merge request hooks and push hooks (commits)
         if (!"Merge Request Hook".equals(eventType) && !"Push Hook".equals(eventType)) {
-            return ResponseEntity.ok("Ignored: Not a Merge Request event");
+            return ResponseEntity.ok("Ignored: Not a Merge Request or Push event");
         }
 
-        //  process the AI review in a background thread to prevent gitlab timeouts
+        //  pass the payload to the strategy router in a background thread
         webhookService.processGitlabEventAsync(payload);
 
         //  return immediately so gitlab registers a successful webhook delivery
